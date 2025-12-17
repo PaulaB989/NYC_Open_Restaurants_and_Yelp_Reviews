@@ -1,0 +1,861 @@
+---
+title: "Data607 - Final Project"
+author: "Paula Brown"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo
+    code_folding: show
+---
+
+
+# Introduction
+California's restaurant inspection program provides comprehensive health and safety data for food establishments across the state. By analyzing inspection data from California's health departments and linking it to public sentiment expressed in Yelp reviews, this project explores how regulatory compliance and customer experience intersect in the state's diverse dining landscape.
+
+The goal is to uncover patterns between inspection outcomes and online reviews—highlighting which types of violations may correlate with lower ratings or negative feedback. This analysis combines structured government data with unstructured consumer sentiment to offer a richer understanding of restaurant performance, public perception, and the broader implications for public health policy and hospitality management.
+
+# Setup Global Options
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Load Required Libraries
+```{r init2, echo = TRUE, message = TRUE, warning = TRUE}
+req_packages <- c("DBI","RMySQL","dplyr","dbplyr","knitr","tidyr", "readr", "stringr","tibble", "rmarkdown", "purrr", "lubridate", "here", "httr2", "httr",  "RCurl","rvest","xml2","jsonlite","kableExtra", "tidytext", "geniusr","sentimentr","syuzhet","ggplot2", "tidyverse","DT","fuzzyjoin")
+for (pkg in req_packages) {
+  if (!require(pkg, character.only = TRUE)) {
+    message(paste("Installing package:", pkg))
+    install.packages(pkg, dependencies = TRUE)
+  } else {
+    message(paste(pkg, " already installed."))
+  }
+  library(pkg, character.only = TRUE)
+}
+```
+
+# Data Loading
+
+## CA Restaurant Data
+Retrieve the CA restaurant inspection data from GitHub and load into dataframes.
+```{r retrieve_CA_rest_data}
+# Base URL for raw GitHub files
+base_url <- "https://raw.githubusercontent.com/PaulaB989/NYC_Open_Restaurants_and_Yelp_Reviews/main/"
+
+# Read/push CSV data into dataframe
+# ---- CA Restaurant CSV ----
+CA_Inspections_csv <- paste0(base_url, "CA_inspections.csv")
+CA_Inspections <- read_csv(CA_Inspections_csv)
+
+# ---- CA Violations ----
+CA_Violations_csv <- paste0(base_url, "CA_violations.csv")
+CA_Violations <- read_csv(CA_Violations_csv)
+
+# Display structure
+cat("CA Restaurant Inspections data loaded:\n")
+cat("Rows:", nrow(CA_Inspections), "\n")
+cat("Columns:", ncol(CA_Inspections), "\n")
+cat("Column names:", paste(names(CA_Inspections), collapse = ", "), "\n\n")
+cat("CA Restaurants Violations loaded:\n")
+cat("Rows:", nrow(CA_Violations), "\n")
+cat("Columns:", ncol(CA_Violations), "\n")
+cat("Column names:", paste(names(CA_Violations), collapse = ", "), "\n\n")
+
+#Glimpse the data
+glimpse(CA_Inspections)
+glimpse(CA_Violations)
+```
+
+## Prepare pulling split business and review files from GitHub
+Since the files were too large to upload into Github via web, the files were downloaded from the Yelp Open Dataset JSON file at https://business.yelp.com/data/resources/open-dataset/, then split into uploadable sizes and uploaded into GitHub using mac Terminal. Now that we have split files we need to append them for our respective data frames.
+```{r get_files}
+repo_api <- "https://api.github.com/repos/PaulaB989/NYC_Open_Restaurants_and_Yelp_Reviews/contents"
+files_info <- content(GET(repo_api))
+
+# Extract file names
+all_files <- sapply(files_info, function(x) x$name)
+cat("Total files found:", length(all_files), "\n")
+cat("All files:\n")
+print(all_files)
+```
+
+## Yelp Business Data
+All files are in one folder, so here we use a pattern and pull them into a frame.
+```{r yelp_business}
+business_files <- grep("business.*\\.json", all_files, value = TRUE)
+cat("Business files found:", length(business_files), "\n")
+print(business_files)
+```
+
+## Yelp Reviews Data
+All files are in one folder, so here we use a pattern and pull them into a frame.
+```{r yelp_reviews}
+review_files <- grep("review.*\\.json", all_files, value = TRUE)
+cat("Review files found:", length(review_files), "\n")
+print(review_files)
+```
+
+## Safe Load Function
+Try and Catch errors and skip files with errors
+```{r safe_load}
+# Function specifically designed for JSONL format (one JSON per line)
+safe_load <- function(file_name) {
+  file_url <- paste0(base_url, file_name)
+  
+  # Method 1: stream_in (best for JSONL/ndjson format like Yelp data)
+  result <- tryCatch({
+    cat("  Loading (stream_in):", file_name, "\n")
+    con <- url(file_url)
+    data <- stream_in(con, verbose = FALSE)
+    close(con)
+    
+    if(is.data.frame(data) && nrow(data) > 0) {
+      cat("  SUCCESS -", nrow(data), "rows loaded\n")
+      return(data)
+    }
+    NULL
+  }, error = function(e) {
+    cat("   stream_in failed:", e$message, "\n")
+    NULL
+  })
+  
+  if(!is.null(result)) return(result)
+  
+  # Method 2: Read line by line and parse each JSON object
+  result <- tryCatch({
+    cat("  Trying line-by-line parsing...\n")
+    lines <- readLines(file_url, warn = FALSE)
+    
+    # Parse each non-empty line as a separate JSON object
+    data_list <- lapply(seq_along(lines), function(i) {
+      if(lines[i] != "" && nchar(lines[i]) > 2) {
+        tryCatch({
+          fromJSON(lines[i], flatten = TRUE)
+        }, error = function(e) {
+          if(i <= 5) cat("    Error on line", i, ":", e$message, "\n")
+          NULL
+        })
+      } else {
+        NULL
+      }
+    })
+    
+    # Remove NULL entries and combine
+    data_list <- Filter(Negate(is.null), data_list)
+    
+    if(length(data_list) > 0) {
+      data <- bind_rows(data_list)
+      if(nrow(data) > 0) {
+        cat("  SUCCESS - line-by-line loaded", nrow(data), "rows\n")
+        return(data)
+      }
+    }
+    NULL
+  }, error = function(e) {
+    cat("   line-by-line failed:", e$message, "\n")
+    NULL
+  })
+  
+  if(!is.null(result)) return(result)
+  
+  cat("   FAILED - Could not load", file_name, "\n")
+  return(NULL)
+}
+```
+
+## Safe Load Business Function
+Special function to handle business data with nested columns
+```{r safe_load_business}
+safe_load_business <- function(file_name) {
+  file_url <- paste0(base_url, file_name)
+  
+  cat("  Loading:", file_name, "\n")
+  
+  tryCatch({
+    # Download file
+    lines <- readLines(file_url, warn = FALSE)
+    lines <- lines[nchar(lines) > 0]
+    cat("    Downloaded", length(lines), "lines\n")
+    
+    if(length(lines) == 0) {
+      cat("   No lines to parse\n")
+      return(NULL)
+    }
+    
+    # Parse line by line
+    cat("    Parsing JSON...\n")
+    data_list <- list()
+    error_count <- 0
+    
+    for(i in seq_along(lines)) {
+      obj <- tryCatch({
+        # Parse without flatten
+        parsed <- fromJSON(lines[i], flatten = FALSE)
+        
+        # Convert ALL nested/list columns to character strings
+        for(col_name in names(parsed)) {
+          if(is.list(parsed[[col_name]]) && !is.data.frame(parsed[[col_name]])) {
+            # Convert to JSON string if it's a list
+parsed[[col_name]] <- as.character(toJSON(parsed[[col_name]], auto_unbox = TRUE))
+} else if(is.null(parsed[[col_name]])) {
+  # Convert NULL to NA character
+  parsed[[col_name]] <- NA_character_
+}
+}
+
+# Convert to single-row data frame to ensure consistent structure
+as.data.frame(parsed, stringsAsFactors = FALSE)
+}, error = function(e) {
+  error_count <<- error_count + 1
+  if(error_count <= 5) {
+    cat("      Line", i, "error:", substr(e$message, 1, 80), "\n")
+  }
+  NULL
+})
+
+if(!is.null(obj)) {
+  data_list[[length(data_list) + 1]] <- obj
+}
+
+# Progress indicator
+if(i %% 25000 == 0) {
+  cat("      Parsed", i, "/", length(lines), "-", length(data_list), "successful\n")
+}
+}
+
+cat("    Parsing complete:", length(data_list), "successful,", error_count, "errors\n")
+
+# Combine with bind_rows
+if(length(data_list) > 0) {
+  cat("    Combining rows...\n")
+  data <- bind_rows(data_list)
+  cat("  SUCCESS -", nrow(data), "rows,", ncol(data), "columns\n")
+  return(data)
+} else {
+  cat("   No valid data parsed\n")
+  return(NULL)
+}
+
+}, error = function(e) {
+  cat("   FAILED:", e$message, "\n")
+  return(NULL)
+})
+}
+```
+
+## Test Load Single File
+```{r test_single_file}
+# Quick test of the first business file to verify loading works
+if(length(business_files) > 0) {
+  cat("\n=== TESTING FIRST BUSINESS FILE ===\n")
+  test_file <- business_files[1]
+  cat("Testing file:", test_file, "\n\n")
+  
+  test_result <- safe_load_business(test_file)
+  
+  if(!is.null(test_result) && nrow(test_result) > 0) {
+    cat("\nTest successful! File format is readable.\n")
+    cat("Sample data from first file:\n")
+    cat("- Rows:", nrow(test_result), "\n")
+    cat("- Columns:", ncol(test_result), "\n")
+    cat("- Column names:", paste(head(names(test_result), 10), collapse = ", "), "\n")
+    
+    # Show first few CA businesses if any
+    if("state" %in% names(test_result)) {
+      ca_count <- sum(test_result$state == "CA", na.rm = TRUE)
+      cat("- CA businesses in this file:", ca_count, "\n")
+    }
+  } else {
+    cat("\n Test failed - check the error messages above\n")
+  }
+}
+```
+
+## Load Business Data
+```{r load_business}
+cat("\n=== LOADING BUSINESS FILES ===\n")
+cat("Total files to load:", length(business_files), "\n\n")
+
+# Load business files using the simpler function
+business_list <- list()
+for(i in seq_along(business_files)) {
+  cat("Loading business file", i, "of", length(business_files), "\n")
+  business_list[[i]] <- safe_load_business(business_files[i])
+}
+
+# Remove NULL entries
+business_list <- Filter(Negate(is.null), business_list)
+cat("\nSuccessfully loaded", length(business_list), "out of", length(business_files), "business files\n")
+
+if(length(business_list) > 0) {
+  cat("\nCombining business data...\n")
+  business <- bind_rows(business_list)
+  cat("\nCombined Business data:\n")
+  cat("Rows:", nrow(business), "\n")
+  cat("Columns:", ncol(business), "\n")
+  if(ncol(business) > 0) {
+    cat("Column names:", paste(head(names(business), 15), collapse = ", "), 
+        if(ncol(business) > 15) "..." else "", "\n")
+  }
+  glimpse(business)
+} else {
+  cat("\n WARNING: No business data loaded!\n")
+  business <- data.frame()
+}
+```
+
+## Load Reviews
+Load review JSON files into the reviews data frame
+```{r load_reviews}
+# Load Review JSONs
+cat("\n=== LOADING REVIEW FILES ===\n")
+cat("Total files to load:", length(review_files), "\n")
+cat("  This may take several minutes with multiple files...\n\n")
+
+# Load reviews in batches with progress
+review_list <- list()
+for(i in seq_along(review_files)) {
+  if(i %% 10 == 0) cat("Progress:", i, "/", length(review_files), "files\n")
+  review_list[[i]] <- safe_load(review_files[i])
+}
+
+# Remove NULL entries
+review_list <- Filter(Negate(is.null), review_list)
+cat("\nSuccessfully loaded", length(review_list), "out of", length(review_files), "review files\n")
+
+if(length(review_list) > 0) {
+  cat("\nCombining review data (this may take a moment)...\n")
+  reviews <- bind_rows(review_list)
+  cat("\nCombined Reviews data:\n")
+  cat("Rows:", nrow(reviews), "\n")
+  cat("Columns:", ncol(reviews), "\n")
+  if(ncol(reviews) > 0) {
+    cat("Column names:", paste(names(reviews), collapse = ", "), "\n")
+  }
+  glimpse(reviews)
+} else {
+  cat("\n WARNING: No review data loaded!\n")
+  reviews <- data.frame()
+}
+```
+
+## Diagnostic Summary
+```{r diagnostic}
+cat("\n=== DIAGNOSTIC SUMMARY ===\n")
+cat("Files found in repo:", length(all_files), "\n")
+cat("Business files identified:", length(business_files), "\n")
+cat("Review files identified:", length(review_files), "\n")
+cat("Business dataframes loaded:", length(business_list), "\n")
+cat("Review dataframes loaded:", length(review_list), "\n")
+cat("Total business rows:", if(exists("business")) nrow(business) else 0, "\n")
+cat("Total review rows:", if(exists("reviews")) nrow(reviews) else 0, "\n")
+
+cat("\n=== DATA STATUS ===\n")
+has_business_data <- exists("business") && nrow(business) > 0
+has_review_data <- exists("reviews") && nrow(reviews) > 0
+cat("Business data available:", has_business_data, "\n")
+cat("Review data available:", has_review_data, "\n")
+
+if(!has_business_data) {
+  cat("\n  WARNING: Business data not loaded properly\n")
+}
+```
+
+# Data Preparation
+
+## Check Data Availability
+```{r check_data_loaded}
+# Check if we have data to work with
+has_business_data <- exists("business") && nrow(business) > 0
+has_review_data <- exists("reviews") && nrow(reviews) > 0
+
+cat("\n=== DATA AVAILABILITY CHECK ===\n")
+cat("Business data available:", has_business_data, "\n")
+cat("Review data available:", has_review_data, "\n")
+
+if(!has_business_data) {
+  cat("\n  STOPPING: Cannot proceed without business data\n")
+  cat("Please check the diagnostic output above to troubleshoot the JSON loading issue.\n")
+  knitr::knit_exit()
+}
+```
+
+## Filter Yelp Data to California
+```{r filter_ca_yelp}
+# Only run if we have business data
+if(has_business_data) {
+  # Filter businesses to California area
+  if("state" %in% names(business)) {
+    business_CA <- business %>%
+      filter(state == "CA")
+    cat("CA Yelp businesses (filtered by state):", nrow(business_CA), "\n")
+  } else if("city" %in% names(business)) {
+    # Fallback to city-based filtering if state not available
+    business_CA <- business %>%
+      filter(grepl("Los Angeles|San Francisco|San Diego|Sacramento|San Jose", 
+                   city, ignore.case = TRUE))
+    cat("CA Yelp businesses (filtered by city):", nrow(business_CA), "\n")
+  } else {
+    business_CA <- business
+    cat("CA Yelp businesses (no filtering applied):", nrow(business_CA), "\n")
+  }
+  
+  cat("\nAvailable columns in business data:\n")
+  print(names(business_CA))
+  
+  # Show state distribution
+  if("state" %in% names(business_CA)) {
+    cat("\nState distribution:\n")
+    print(table(business_CA$state))
+  }
+}
+```
+
+## Prepare Restaurant Names for Matching
+```{r prepare_names}
+if(has_business_data && nrow(business_CA) > 0) {
+  # Function to clean restaurant names for matching
+  clean_name <- function(name) {
+    name %>%
+      str_to_lower() %>%
+      str_replace_all("[^a-z0-9\\s]", "") %>%  # Remove special characters
+      str_replace_all("\\s+", " ") %>%          # Normalize spaces
+      str_trim()
+  }
+  
+  # Clean names in CA restaurant dataset
+  if("facility_name" %in% names(CA_Inspections)) {
+    CA_Inspections <- CA_Inspections %>%
+      mutate(clean_name = clean_name(facility_name))
+    cat("Cleaned", nrow(CA_Inspections), "CA restaurant names\n")
+  } else {
+    cat("  'facility_name' column not found\n")
+    cat("Available columns:", paste(names(CA_Inspections), collapse = ", "), "\n")
+  }
+  
+  # Clean names in Yelp business dataset
+  if("name" %in% names(business_CA)) {
+    business_CA <- business_CA %>%
+      mutate(clean_name = clean_name(name))
+    cat("Cleaned", nrow(business_CA), "Yelp business names\n")
+  } else {
+    cat("  'name' column not found in business data\n")
+    cat("Available columns:", paste(names(business_CA), collapse = ", "), "\n")
+  }
+}
+```
+
+## Join CA Inspections with Violations
+```{r join_inspections_violations}
+# Join inspections with violations on serial_number
+ca_data_combined <- CA_Inspections %>%
+  left_join(CA_Violations, by = "serial_number", suffix = c("_insp", "_viol"))
+
+cat("Combined CA data:\n")
+cat("Rows:", nrow(ca_data_combined), "\n")
+cat("Columns:", ncol(ca_data_combined), "\n")
+
+# Check available columns
+cat("\nAvailable columns in combined data:\n")
+print(names(ca_data_combined))
+
+# Check for violation-related columns
+violation_cols <- names(ca_data_combined)[grepl("violation|points|critical|major|minor", 
+                                                 names(ca_data_combined), 
+                                                 ignore.case = TRUE)]
+cat("\nViolation-related columns found:\n")
+print(violation_cols)
+
+# Summary of violations per inspection (with flexible column checking)
+violation_summary <- ca_data_combined %>%
+  group_by(serial_number) %>%
+  summarise(
+    facility_name = first(facility_name),
+    facility_address = first(facility_address),
+    inspection_date = first(activity_date),
+    score = first(score),
+    grade = first(grade),
+    num_violations = n(),
+    # Flexible critical violation detection based on available columns
+    has_critical = if("violation_status" %in% names(ca_data_combined)) {
+      any(violation_status == "Critical", na.rm = TRUE)
+    } else if("points_deducted" %in% names(ca_data_combined)) {
+      any(points_deducted > 0, na.rm = TRUE)
+    } else if("major_violation" %in% names(ca_data_combined)) {
+      any(major_violation == 1 | major_violation == TRUE, na.rm = TRUE)
+    } else {
+      FALSE  # Default if no critical indicator found
+    },
+    total_points_deducted = if("points_deducted" %in% names(ca_data_combined)) {
+      sum(points_deducted, na.rm = TRUE)
+    } else {
+      0
+    },
+    .groups = "drop"
+  )
+
+cat("\nViolation summary created:\n")
+cat("Unique facilities:", n_distinct(violation_summary$facility_name), "\n")
+glimpse(violation_summary)
+```
+
+## Fuzzy Match Yelp Businesses with CA Restaurants
+```{r fuzzy_match}
+# Prepare Yelp data for matching
+yelp_for_matching <- business_CA %>%
+  filter(!is.na(name) & !is.na(address)) %>%
+  mutate(
+    clean_name = clean_name(name),
+    clean_address = str_to_lower(str_trim(address))
+  ) %>%
+  select(business_id, name, address, clean_name, clean_address, 
+         city, postal_code, stars, review_count)
+
+# Prepare CA data for matching
+ca_for_matching <- violation_summary %>%
+  filter(!is.na(facility_name) & !is.na(facility_address)) %>%
+  mutate(
+    clean_name = clean_name(facility_name),
+    clean_address = str_to_lower(str_trim(facility_address))
+  )
+
+cat("\nPreparing fuzzy match...\n")
+cat("Yelp records for matching:", nrow(yelp_for_matching), "\n")
+cat("CA records for matching:", nrow(ca_for_matching), "\n")
+
+# Fuzzy join on name (distance-based)
+matched_restaurants <- ca_for_matching %>%
+  stringdist_left_join(
+    yelp_for_matching,
+    by = c("clean_name" = "clean_name"),
+    max_dist = 3,  # Allow up to 3 character differences
+    distance_col = "name_distance"
+  ) %>%
+  # Further filter by address similarity
+  filter(
+    is.na(name_distance) | name_distance <= 3,
+    !is.na(business_id)
+  ) %>%
+  # Keep best match per facility
+  group_by(serial_number) %>%
+  arrange(name_distance) %>%
+  slice(1) %>%
+  ungroup()
+
+cat("\n=== MATCHING RESULTS ===\n")
+cat("Matched restaurants:", nrow(matched_restaurants), "\n")
+cat("Match rate:", round(nrow(matched_restaurants) / nrow(ca_for_matching) * 100, 2), "%\n")
+
+glimpse(matched_restaurants)
+```
+
+## Join with Yelp Reviews
+```{r join_reviews}
+if(has_review_data && nrow(matched_restaurants) > 0) {
+  # Get reviews for matched businesses
+  matched_reviews <- reviews %>%
+    semi_join(matched_restaurants, by = "business_id") %>%
+    left_join(
+      matched_restaurants %>% 
+        select(business_id, serial_number, facility_name, score, grade, 
+               num_violations, has_critical, total_points_deducted),
+      by = "business_id"
+    )
+  
+  cat("\n=== REVIEW MATCHING RESULTS ===\n")
+  cat("Matched reviews:", nrow(matched_reviews), "\n")
+  cat("Unique businesses with reviews:", n_distinct(matched_reviews$business_id), "\n")
+  
+  glimpse(matched_reviews)
+} else {
+  cat("\n Cannot join reviews - either no review data or no matched restaurants\n")
+  matched_reviews <- data.frame()
+}
+```
+
+# Hypothesis Testing
+
+## Hypothesis 1: Inspection Scores vs Yelp Ratings
+**H0**: There is no correlation between inspection scores and Yelp star ratings  
+**H1**: Higher inspection scores correlate with higher Yelp ratings
+
+```{r hypothesis1_test}
+if(nrow(matched_restaurants) > 0) {
+  # Aggregate data for correlation
+  h1_data <- matched_restaurants %>%
+    filter(!is.na(score) & !is.na(stars) & score > 0) %>%
+    select(facility_name, score, stars, num_violations, grade)
+  
+  # Correlation test
+  cor_test <- cor.test(h1_data$score, h1_data$stars, method = "pearson")
+  
+  cat("\n=== HYPOTHESIS 1 RESULTS ===\n")
+  cat("Sample size:", nrow(h1_data), "\n")
+  cat("Correlation coefficient:", round(cor_test$estimate, 4), "\n")
+  cat("P-value:", format.pval(cor_test$p.value, digits = 4), "\n")
+  cat("95% Confidence Interval: [", round(cor_test$conf.int[1], 4), ", ", 
+      round(cor_test$conf.int[2], 4), "]\n", sep = "")
+  
+  if(cor_test$p.value < 0.05) {
+    cat("REJECT H0: Significant correlation exists\n")
+  } else {
+    cat(" FAIL TO REJECT H0: No significant correlation\n")
+  }
+  
+  # Visualization
+  ggplot(h1_data, aes(x = score, y = stars)) +
+    geom_point(alpha = 0.4, color = "steelblue") +
+    geom_smooth(method = "lm", color = "darkred", se = TRUE) +
+    labs(
+      title = "Inspection Score vs Yelp Star Rating",
+      subtitle = paste0("Correlation: ", round(cor_test$estimate, 3), 
+                        " (p = ", format.pval(cor_test$p.value, digits = 3), ")"),
+      x = "Health Inspection Score (Higher = Better)",
+      y = "Yelp Star Rating"
+    ) +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+          plot.subtitle = element_text(hjust = 0.5))
+}
+```
+
+**Interpretation:**
+**There's a statistically significant but weak negative correlation (-0.124) between health inspection scores and Yelp ratings. Oddly, restaurants with better health scores tend to have slightly lower Yelp ratings. The relationship is extremely weak though, and the scatter plot shows ratings are heavily clustered at whole-number values (3.0, 4.0, 5.0 stars) with minimal variation across inspection scores.**
+
+## Hypothesis 2: Critical Violations vs Review Sentiment
+**H0**: Restaurants with critical violations have the same average Yelp rating as those without  
+**H1**: Restaurants with critical violations have lower average Yelp ratings
+
+```{r hypothesis2_test}
+if(nrow(matched_reviews) > 0 && "has_critical" %in% names(matched_reviews)) {
+  # Calculate average rating by critical violation status
+  h2_data <- matched_reviews %>%
+    group_by(business_id, has_critical) %>%
+    summarise(
+      avg_stars = mean(stars, na.rm = TRUE),
+      facility_name = first(facility_name),
+      .groups = "drop"
+    ) %>%
+    filter(!is.na(has_critical) & !is.na(avg_stars))
+  
+  # Two-sample t-test with sufficient sample check
+  critical_yes <- h2_data %>% filter(has_critical == TRUE) %>% pull(avg_stars)
+  critical_no <- h2_data %>% filter(has_critical == FALSE) %>% pull(avg_stars)
+  
+  cat("\n=== HYPOTHESIS 2 RESULTS ===\n")
+  cat("Sample with critical violations:", length(critical_yes), "\n")
+  cat("Sample without critical violations:", length(critical_no), "\n")
+  
+  # Check if we have enough data for t-test (need at least 2 observations in each group)
+  if(length(critical_yes) >= 2 && length(critical_no) >= 2) {
+    cat("Mean rating (with critical violations):", round(mean(critical_yes), 3), "\n")
+    cat("Mean rating (without critical violations):", round(mean(critical_no), 3), "\n")
+    cat("Difference:", round(mean(critical_yes) - mean(critical_no), 3), "\n")
+    
+    t_test <- t.test(critical_yes, critical_no, alternative = "less")
+    
+    cat("T-statistic:", round(t_test$statistic, 4), "\n")
+    cat("P-value:", format.pval(t_test$p.value, digits = 4), "\n")
+    
+    if(t_test$p.value < 0.05) {
+      cat("REJECT H0: Critical violations associated with lower ratings\n")
+    } else {
+      cat(" FAIL TO REJECT H0: No significant difference\n")
+    }
+    
+    # Visualization
+    ggplot(h2_data, aes(x = has_critical, y = avg_stars, fill = has_critical)) +
+      geom_boxplot(alpha = 0.7) +
+      geom_jitter(width = 0.2, alpha = 0.3) +
+      scale_fill_manual(values = c("TRUE" = "#E74C3C", "FALSE" = "#2ECC71")) +
+      labs(
+        title = "Yelp Ratings: Critical Violations vs None",
+        subtitle = paste0("p-value: ", format.pval(t_test$p.value, digits = 3)),
+        x = "Has Critical Violations",
+        y = "Average Yelp Star Rating",
+        fill = "Critical Violations"
+      ) +
+      theme_minimal() +
+      theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+            plot.subtitle = element_text(hjust = 0.5))
+  } else {
+    cat("\n INSUFFICIENT DATA for t-test\n")
+    cat("T-test requires at least 2 observations in each group.\n")
+    
+    # Show descriptive statistics instead
+    if(length(critical_yes) > 0) {
+      cat("Mean rating (with critical violations):", round(mean(critical_yes), 3), "\n")
+    }
+    if(length(critical_no) > 0) {
+      cat("Mean rating (without critical violations):", round(mean(critical_no), 3), "\n")
+    }
+    
+    # Simple visualization if we have any data
+    if(nrow(h2_data) > 0) {
+      ggplot(h2_data, aes(x = has_critical, y = avg_stars, fill = has_critical)) +
+        geom_point(alpha = 0.5, size = 3) +
+        scale_fill_manual(values = c("TRUE" = "#E74C3C", "FALSE" = "#2ECC71")) +
+        labs(
+          title = "Yelp Ratings: Critical Violations vs None",
+          subtitle = "Insufficient data for statistical test",
+          x = "Has Critical Violations",
+          y = "Average Yelp Star Rating",
+          fill = "Critical Violations"
+        ) +
+        theme_minimal() +
+        theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+              plot.subtitle = element_text(hjust = 0.5))
+    }
+  }
+} else {
+  cat("\n Cannot perform Hypothesis 2 test - missing required data\n")
+}
+```
+
+**Interpretation:**
+**The chart indicates insufficient data for statistical testing, but shows that among restaurants without critical violations, Yelp ratings span the full range from 1 to 5 stars. This suggests critical violations alone don't determine customer ratings.**
+
+## Hypothesis 3: Number of Violations vs Review Count
+**H0**: The number of violations does not affect review volume  
+**H1**: Restaurants with more violations receive more reviews (negative publicity effect)
+
+```{r hypothesis3_test}
+if(nrow(matched_restaurants) > 0) {
+  h3_data <- matched_restaurants %>%
+    filter(!is.na(num_violations) & !is.na(review_count)) %>%
+    select(facility_name, num_violations, review_count, stars)
+  
+  # Correlation test
+  cor_test_h3 <- cor.test(h3_data$num_violations, h3_data$review_count, 
+                          method = "spearman")
+  
+  cat("\n=== HYPOTHESIS 3 RESULTS ===\n")
+  cat("Sample size:", nrow(h3_data), "\n")
+  cat("Spearman correlation:", round(cor_test_h3$estimate, 4), "\n")
+  cat("P-value:", format.pval(cor_test_h3$p.value, digits = 4), "\n")
+  
+  if(cor_test_h3$p.value < 0.05) {
+    if(cor_test_h3$estimate > 0) {
+      cat("REJECT H0: More violations associated with more reviews\n")
+    } else {
+      cat("REJECT H0: More violations associated with fewer reviews\n")
+    }
+  } else {
+    cat(" FAIL TO REJECT H0: No significant relationship\n")
+  }
+  
+  # Visualization
+  ggplot(h3_data, aes(x = num_violations, y = review_count)) +
+    geom_point(alpha = 0.4, color = "steelblue") +
+    geom_smooth(method = "lm", color = "darkred", se = TRUE) +
+    scale_y_log10() +
+    labs(
+      title = "Violations vs Review Volume",
+      subtitle = paste0("Spearman \rho: ", round(cor_test_h3$estimate, 3),
+                        " (p = ", format.pval(cor_test_h3$p.value, digits = 3), ")"),
+      x = "Number of Violations",
+      y = "Review Count (log scale)"
+    ) +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+          plot.subtitle = element_text(hjust = 0.5))
+}
+```
+
+**Interpretation:**
+**A very weak positive correlation exists between violation counts and review volume. Restaurants with more reviews tend to have slightly more violations, though the effect is negligible. The log scale reveals most restaurants cluster in the 0-10 violation range regardless of review count.**
+
+## Yelp Rating Distribution by Grade
+```{r viz_rating_by_grade}
+if(nrow(matched_restaurants) > 0) {
+  grade_rating_data <- matched_restaurants %>%
+    filter(!is.na(grade) & !is.na(stars) & grade %in% c("A", "B", "C"))
+  
+  if(nrow(grade_rating_data) > 0) {
+    ggplot(grade_rating_data, aes(x = stars, fill = grade)) +
+      geom_density(alpha = 0.6) +
+      scale_fill_manual(values = c("A" = "#2ECC71", "B" = "#F39C12", "C" = "#E74C3C")) +
+      labs(
+        title = "Yelp Star Rating Distribution by Inspection Grade",
+        x = "Yelp Star Rating",
+        y = "Density",
+        fill = "Grade"
+      ) +
+      theme_minimal() +
+      theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+  }
+}
+```
+
+**Interpretation:**
+**Grade A restaurants show a sharp peak around 3-star ratings, Grade B restaurants have a broader distribution centered around 3.5-4 stars, while Grade C restaurants show the widest spread with substantial density across 3-5 stars. This suggests inspection grades and customer ratings measure different aspects of restaurant quality.**
+
+## Heatmap: Violations vs Ratings
+```{r viz_heatmap}
+if(nrow(matched_restaurants) > 0) {
+  heatmap_data <- matched_restaurants %>%
+    filter(!is.na(stars) & !is.na(num_violations)) %>%
+    mutate(
+      violation_category = cut(num_violations, 
+                               breaks = c(0, 2, 5, 10, Inf),
+                               labels = c("0-2", "3-5", "6-10", "10+"),
+                               include.lowest = TRUE),
+      rating_category = cut(stars,
+                           breaks = c(0, 2, 3, 4, 5),
+                           labels = c("1-2 stars", "3 stars", "4 stars", "5 stars"),
+                           include.lowest = TRUE)
+    ) %>%
+    count(violation_category, rating_category)
+  
+  if(nrow(heatmap_data) > 0) {
+    ggplot(heatmap_data, aes(x = violation_category, y = rating_category, fill = n)) +
+      geom_tile(color = "white") +
+      geom_text(aes(label = n), color = "white", fontface = "bold") +
+      scale_fill_gradient(low = "#3498db", high = "#e74c3c") +
+      labs(
+        title = "Restaurant Distribution: Violations vs Yelp Ratings",
+        x = "Number of Violations",
+        y = "Yelp Star Rating",
+        fill = "Count"
+      ) +
+      theme_minimal() +
+      theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+  }
+}
+```
+
+**Interpretation:**
+**The vast majority of restaurants fall into the 3-5 violation range with 3-4 star ratings (shown by the dark red cells). Very few restaurants have 10+ violations, and those that do still maintain respectable 3-5 star ratings. Low-rated restaurants (1-2 stars) are relatively rare across all violation categories.**
+
+# Overall Conclusion:
+This analysis shows that California’s health inspection scores and Yelp ratings capture different dimensions of restaurant quality. While inspection scores reflect regulatory compliance and food safety, Yelp ratings are shaped more by customer experience, taste, service, and expectations.
+The statistical relationships between the two are consistently weak or negligible:
+Restaurants with higher inspection scores sometimes have slightly lower Yelp ratings, but the effect is minimal.
+Critical violations do not reliably predict poor Yelp reviews.
+Review volume has almost no meaningful connection to violation counts.
+Inspection grades and Yelp ratings display distinct distribution patterns, underscoring that they measure separate aspects of performance.
+Taken together, the findings suggest that public perception and regulatory outcomes operate in parallel rather than in sync. Customers rarely reward or penalize restaurants based on health inspection results, and Yelp reviews cannot be used as a proxy for food safety.
+For policymakers and hospitality managers, this highlights the importance of treating inspection data and consumer sentiment as complementary but independent tools. Health departments safeguard public safety, while Yelp reviews reflect customer satisfaction. Both perspectives are valuable, but neither alone provides a complete picture of restaurant quality.
+
+# References:
+
+- [LA County Restaurant Inspections and Violations (Kaggle)](https://www.kaggle.com/datasets/meganrisdal/la-county-restaurant-inspections-and-violations) 
+
+- [Yelp Open Dataset](https://business.yelp.com/data/resources/open-dataset/)
+
+## Save Processed Data for Presentation
+````{r save_data}
+# Save all the data objects needed for visualizations
+save(
+  h1_data, 
+  h2_data, 
+  h3_data, 
+  grade_rating_data, 
+  heatmap_data,
+  matched_restaurants,
+  file = "analysis_data.RData"
+)
+
+cat("Data saved successfully for presentation deck!\n")
+````
